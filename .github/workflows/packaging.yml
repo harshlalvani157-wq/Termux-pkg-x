@@ -216,15 +216,6 @@ jobs:
           ' "$SETUP" > "$SETUP.new" && mv "$SETUP.new" "$SETUP"
         fi
 
-    # =================================================================
-    # Dependency strategy:
-    #   use-repo-deps=true:
-    #     - leave termux_download_deb_pac.sh alone
-    #     - patch it to fetch Packages.gz (our repo has no .xz)
-    #   use-repo-deps=false:
-    #     - force source builds
-    # NO apt update anywhere — the container is Ubuntu, not Termux.
-    # =================================================================
     - name: Configure dependency strategy
       env:
         USE_REPO_DEPS: ${{ github.event.inputs.use-repo-deps || 'false' }}
@@ -237,14 +228,9 @@ jobs:
 
         if [ "$USE_REPO_DEPS" = "true" ]; then
           echo ">>> Dependencies fetched from https://xodiosx.github.io/Termux-pkg-x"
-          echo ">>> Patching termux_download_deb_pac.sh to use Packages.gz (we have no .xz)"
-
-          # Our repo publishes Packages.gz only (GH Pages corrupts .xz).
           sed -i 's|Packages\.xz|Packages.gz|g' "$TDP"
           sed -i 's|xz -d|gzip -d|g'             "$TDP"
           sed -i 's|unxz|gunzip|g'               "$TDP"
-
-          echo ">>> relevant lines after patch:"
           grep -nE 'Packages\.gz|gzip -d|gunzip' "$TDP" || true
         else
           echo ">>> Forcing source builds of all dependencies"
@@ -325,6 +311,11 @@ jobs:
       if: ${{ steps.build-info.outputs.free-space == 'true' }}
       run: ./scripts/free-space.sh
 
+    # =================================================================
+    # Two-pass build with topological ordering and per-failure logs.
+    # Pass 1: build in dependency order (buildorder.py).
+    # Pass 2: retry whatever failed in pass 1.
+    # =================================================================
     - name: Build packages
       run: |
         set -euo pipefail
@@ -345,42 +336,144 @@ jobs:
           exit 0
         fi
 
-        {
-          echo 'set -uo pipefail'
-          echo 'PREFIX=/data/data/app.xodos2/files/usr'
-          echo 'BUILD_ROOT=/home/builder/termux-packages'
-          echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
-          echo 'cd "$BUILD_ROOT"'
-          echo ''
-          echo 'rm -rf /data/data/.built-packages 2>/dev/null || true'
-          echo 'rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true'
-          echo 'rm -rf /data/data/app.xodos2/files/.built-packages 2>/dev/null || true'
-          echo ''
-          echo 'declare -a failed=()'
-          echo 'declare -a built=()'
-          echo "for pkg in ${PKGS_STR}; do"
-          echo '  echo "=================================================="'
-          echo '  echo ">>> Building: $pkg"'
-          echo '  echo "=================================================="'
-          echo '  if ./build-package.sh -C -f -a aarch64 "$pkg"; then'
-          echo '    built+=("$pkg")'
-          echo '    echo ">>> OK: $pkg"'
-          echo '  else'
-          echo '    failed+=("$pkg")'
-          echo '    echo ">>> FAILED: $pkg"'
-          echo '  fi'
-          echo 'done'
-          echo 'echo ""'
-          echo 'echo "=================================================="'
-          echo "echo \">>> built \${#built[@]}: \${built[*]:-<none>}\""
-          echo "echo \">>> failed \${#failed[@]}: \${failed[*]:-<none>}\""
-          echo 'echo "=================================================="'
-          echo 'if [ "${#failed[@]}" -gt 0 ]; then exit 2; fi'
-        } > /tmp/inner-build.sh
+        cat > /tmp/inner-build.sh <<'INNER'
+        set -uo pipefail
+        PREFIX=/data/data/app.xodos2/files/usr
+        BUILD_ROOT=/home/builder/termux-packages
+        mkdir -p "$PREFIX/var/lib/dpkg/info"
+        cd "$BUILD_ROOT"
 
-        cat /tmp/inner-build.sh
+        # Wipe stale markers so -f really rebuilds
+        rm -rf /data/data/.built-packages 2>/dev/null || true
+        rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true
+        rm -rf /data/data/app.xodos2/files/.built-packages 2>/dev/null || true
+
+        TARGETS="$1"
+        echo ">>> Targets requested: $TARGETS"
+
+        # -------------------------------------------------------------
+        # 1. Compute topological build order across ALL targets and
+        #    their transitive deps using termux's own buildorder.py.
+        #    buildorder.py prints "<pkg> <dir>" one per line.
+        # -------------------------------------------------------------
+        echo ""
+        echo ">>> Computing dependency order via buildorder.py"
+        ORDER_FILE=/tmp/buildorder-resolved.txt
+        if [ -f scripts/buildorder.py ]; then
+          python3 scripts/buildorder.py $TARGETS > /tmp/buildorder-full.txt 2>/dev/null || true
+          # Filter: only keep packages that are among the requested set
+          # OR whose name is a dependency (we can't know the requested
+          # set here, so keep everything buildorder.py emits that
+          # matches one of the target names).
+          for t in $TARGETS; do
+            grep -E "^${t}\b" /tmp/buildorder-full.txt >> "$ORDER_FILE" 2>/dev/null || true
+          done
+          # If buildorder.py couldn't resolve, fall back to requested order
+          if [ ! -s "$ORDER_FILE" ]; then
+            for t in $TARGETS; do
+              echo "$t" >> "$ORDER_FILE"
+            done
+          fi
+        else
+          for t in $TARGETS; do
+            echo "$t" >> "$ORDER_FILE"
+          done
+        fi
+
+        # dedupe preserving order
+        awk '!seen[$1]++' "$ORDER_FILE" > "$ORDER_FILE.dedup" && mv "$ORDER_FILE.dedup" "$ORDER_FILE"
+
+        echo ">>> Resolved order ($(wc -l < "$ORDER_FILE") entries):"
+        cat "$ORDER_FILE"
+
+        # -------------------------------------------------------------
+        # 2. Pass 1: build in that order
+        # -------------------------------------------------------------
+        echo ""
+        echo "=================================================="
+        echo ">>> PASS 1"
+        echo "=================================================="
+        declare -a failed=()
+        declare -a built=()
+        declare -A failure_log
+
+        while read -r pkg _rest; do
+          [ -z "$pkg" ] && continue
+          echo "--------------------------------------------------"
+          echo ">>> Building: $pkg"
+          echo "--------------------------------------------------"
+          LOG="/tmp/build-${pkg}.log"
+          if ./build-package.sh -C -f -a aarch64 "$pkg" > "$LOG" 2>&1; then
+            built+=("$pkg")
+            echo ">>> OK: $pkg"
+          else
+            failed+=("$pkg")
+            failure_log["$pkg"]="$LOG"
+            echo ">>> FAILED: $pkg  (log: $LOG)"
+            echo "--- last 60 lines of $pkg log ---"
+            tail -60 "$LOG" || true
+            echo "--- end $pkg ---"
+          fi
+        done < "$ORDER_FILE"
+
+        echo ""
+        echo "=================================================="
+        echo ">>> PASS 1 summary: built ${#built[@]}, failed ${#failed[@]}"
+        echo ">>> failed: ${failed[*]:-<none>}"
+        echo "=================================================="
+
+        # -------------------------------------------------------------
+        # 3. Pass 2: retry failures now that deps are installed
+        # -------------------------------------------------------------
+        if [ "${#failed[@]}" -gt 0 ]; then
+          echo ""
+          echo "=================================================="
+          echo ">>> PASS 2 (retry of ${#failed[@]} failed packages)"
+          echo ">>> now that all deps are installed"
+          echo "=================================================="
+          declare -a still_failed=()
+          for pkg in "${failed[@]}"; do
+            echo "--------------------------------------------------"
+            echo ">>> Retrying: $pkg"
+            echo "--------------------------------------------------"
+            LOG="/tmp/build-${pkg}-retry.log"
+            if ./build-package.sh -C -f -a aarch64 "$pkg" > "$LOG" 2>&1; then
+              built+=("$pkg")
+              echo ">>> OK (retry): $pkg"
+            else
+              still_failed+=("$pkg")
+              failure_log["$pkg"]="$LOG"
+              echo ">>> STILL FAILED: $pkg  (log: $LOG)"
+              echo "--- last 60 lines of $pkg retry log ---"
+              tail -60 "$LOG" || true
+              echo "--- end $pkg ---"
+            fi
+          done
+          failed=("${still_failed[@]}")
+        fi
+
+        echo ""
+        echo "=================================================="
+        echo ">>> FINAL built ${#built[@]}: ${built[*]:-<none>}"
+        echo ">>> FINAL failed ${#failed[@]}: ${failed[*]:-<none>}"
+        echo "=================================================="
+
+        # Save failure names for the workflow to surface
+        printf '%s\n' "${failed[@]}" > /tmp/final-failed.txt 2>/dev/null || true
+
+        if [ "${#failed[@]}" -gt 0 ]; then
+          exit 2
+        fi
+        INNER
+
+        chmod +x /tmp/inner-build.sh
         ENCODED=$(base64 -w0 /tmp/inner-build.sh)
-        ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || true
+
+        # Pass the target list as $1 to the inner script
+        TARGETS_ESCAPED=$(printf '%q ' "${packages[@]}")
+        ./scripts/run-docker.sh -d bash -c \
+          "echo '${ENCODED}' | base64 -d | bash -s -- ${TARGETS_ESCAPED}" \
+          || echo "::warning::Some packages failed to build — continuing"
 
     - name: Generate build artifacts
       if: always()
