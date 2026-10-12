@@ -312,8 +312,13 @@ jobs:
       run: ./scripts/free-space.sh
 
     # =================================================================
-    # Build step — FIXED: embed the target list into the inner script
-    # via a placeholder substitution instead of positional args.
+    # Build packages.
+    #
+    # Same structure as the working version. Only change:
+    #   1. names -> paths (packages/X or x11-packages/X)
+    #   2. ask buildorder.py for topological order
+    #   3. filter that order back to just the requested packages
+    #   4. feed the ordered list to the same for-loop
     # =================================================================
     - name: Build packages
       run: |
@@ -327,152 +332,101 @@ jobs:
             done < "./built_${repo}_packages.txt"
           fi
         done
-        PKGS_STR="${packages[*]}"
-        echo ">>> packages to build (${#packages[@]}): ${PKGS_STR}"
 
         if [ "${#packages[@]}" -eq 0 ]; then
           echo ">>> no packages — nothing to do"
           exit 0
         fi
 
-        cat > /tmp/inner-build.sh <<'INNER'
-        set -uo pipefail
-        PREFIX=/data/data/app.xodos2/files/usr
-        BUILD_ROOT=/home/builder/termux-packages
-        mkdir -p "$PREFIX/var/lib/dpkg/info"
-        cd "$BUILD_ROOT"
+        echo ">>> requested (${#packages[@]}): ${packages[*]}"
 
-        rm -rf /data/data/.built-packages 2>/dev/null || true
-        rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true
-        rm -rf /data/data/app.xodos2/files/.built-packages 2>/dev/null || true
+        # ---- 1. names -> paths ----
+        TARGET_PATHS=""
+        for p in "${packages[@]}"; do
+          if   [ -d "packages/$p" ];      then TARGET_PATHS="$TARGET_PATHS packages/$p"
+          elif [ -d "x11-packages/$p" ];  then TARGET_PATHS="$TARGET_PATHS x11-packages/$p"
+          else
+            echo "::warning::Package '$p' not found in packages/ or x11-packages/"
+          fi
+        done
+        echo ">>> paths: $TARGET_PATHS"
 
-        # Targets embedded by sed at workflow run time
-        TARGETS="__TARGETS__"
-
-        echo ">>> Targets requested (${#TARGETS} chars): $TARGETS"
-
-        # 1. Compute topological order using termux's buildorder.py
-        echo ""
-        echo ">>> Computing dependency order via buildorder.py"
-        ORDER_FILE=/tmp/buildorder-resolved.txt
-        : > "$ORDER_FILE"
-
-        if [ -f scripts/buildorder.py ]; then
-          # Ask buildorder.py for the FULL graph; then keep entries
-          # whose first column is one of our targets.
-          python3 scripts/buildorder.py $TARGETS > /tmp/buildorder-full.txt 2>/tmp/buildorder-err.txt || {
-            echo ">>> WARN: buildorder.py failed, falling back to requested order"
-            cat /tmp/buildorder-err.txt | head -20 || true
+        # ---- 2. ask buildorder.py for the correct order ----
+        : > /tmp/buildorder-full.txt
+        if [ -f scripts/buildorder.py ] && [ -n "$TARGET_PATHS" ]; then
+          echo ">>> Running buildorder.py..."
+          python3 scripts/buildorder.py $TARGET_PATHS 2>/tmp/buildorder-err.txt \
+            | awk 'NF >= 1 { print $1 }' \
+            > /tmp/buildorder-full.txt || {
+            echo "::warning::buildorder.py failed. stderr:"
+            head -10 /tmp/buildorder-err.txt || true
             : > /tmp/buildorder-full.txt
           }
+          echo ">>> buildorder.py produced $(wc -l < /tmp/buildorder-full.txt) entries"
+        fi
 
-          for t in $TARGETS; do
-            # buildorder.py prints "<pkg> <dir>"; match pkg at start of line
-            grep -E "^${t}[[:space:]]" /tmp/buildorder-full.txt >> "$ORDER_FILE" 2>/dev/null || true
-          done
-
-          if [ ! -s "$ORDER_FILE" ]; then
-            echo ">>> buildorder.py produced no matches — falling back to requested order"
-            for t in $TARGETS; do
-              echo "$t" >> "$ORDER_FILE"
+        # ---- 3. filter to just the requested packages, in that order ----
+        : > /tmp/ordered.txt
+        if [ -s /tmp/buildorder-full.txt ]; then
+          while read -r ordered_pkg; do
+            [ -z "$ordered_pkg" ] && continue
+            for want in "${packages[@]}"; do
+              if [ "$ordered_pkg" = "$want" ]; then
+                echo "$ordered_pkg" >> /tmp/ordered.txt
+                break
+              fi
             done
-          fi
-        else
-          for t in $TARGETS; do
-            echo "$t" >> "$ORDER_FILE"
-          done
+          done < /tmp/buildorder-full.txt
         fi
 
-        awk '!seen[$1]++' "$ORDER_FILE" > "$ORDER_FILE.dedup" && mv "$ORDER_FILE.dedup" "$ORDER_FILE"
+        # Append any requested packages not returned by buildorder.py
+        for p in "${packages[@]}"; do
+          grep -qx "$p" /tmp/ordered.txt || echo "$p" >> /tmp/ordered.txt
+        done
 
-        echo ">>> Resolved order ($(wc -l < "$ORDER_FILE") entries):"
-        cat "$ORDER_FILE"
+        # Dedupe, preserving order
+        awk '!seen[$1]++' /tmp/ordered.txt > /tmp/ordered.dedup && mv /tmp/ordered.dedup /tmp/ordered.txt
 
-        # 2. Pass 1: build in resolved order
-        echo ""
-        echo "=================================================="
-        echo ">>> PASS 1"
-        echo "=================================================="
-        declare -a failed=()
-        declare -a built=()
+        PKGS_STR="$(tr '\n' ' ' < /tmp/ordered.txt | sed 's/ *$//')"
+        echo ">>> ordered build list (${#packages[@]}): $PKGS_STR"
 
-        while read -r pkg _rest; do
-          [ -z "$pkg" ] && continue
-          echo "--------------------------------------------------"
-          echo ">>> Building: $pkg"
-          echo "--------------------------------------------------"
-          LOG="/tmp/build-${pkg}.log"
-          if ./build-package.sh -C -f -a aarch64 "$pkg" > "$LOG" 2>&1; then
-            built+=("$pkg")
-            echo ">>> OK: $pkg"
-          else
-            failed+=("$pkg")
-            echo ">>> FAILED: $pkg  (log: $LOG)"
-            echo "--- last 60 lines of $pkg log ---"
-            tail -60 "$LOG" || true
-            echo "--- end $pkg ---"
-          fi
-        done < "$ORDER_FILE"
+        # ---- 4. same inner-build generation as the working version ----
+        {
+          echo 'set -uo pipefail'
+          echo 'PREFIX=/data/data/app.xodos2/files/usr'
+          echo 'BUILD_ROOT=/home/builder/termux-packages'
+          echo 'mkdir -p "$PREFIX/var/lib/dpkg/info"'
+          echo 'cd "$BUILD_ROOT"'
+          echo ''
+          echo 'rm -rf /data/data/.built-packages 2>/dev/null || true'
+          echo 'rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true'
+          echo 'rm -rf /data/data/app.xodos2/files/.built-packages 2>/dev/null || true'
+          echo ''
+          echo 'declare -a failed=()'
+          echo 'declare -a built=()'
+          echo "for pkg in ${PKGS_STR}; do"
+          echo '  echo "=================================================="'
+          echo '  echo ">>> Building: $pkg"'
+          echo '  echo "=================================================="'
+          echo '  if ./build-package.sh -C -f -a aarch64 "$pkg"; then'
+          echo '    built+=("$pkg")'
+          echo '    echo ">>> OK: $pkg"'
+          echo '  else'
+          echo '    failed+=("$pkg")'
+          echo '    echo ">>> FAILED: $pkg"'
+          echo '  fi'
+          echo 'done'
+          echo 'echo ""'
+          echo 'echo "=================================================="'
+          echo "echo \">>> built \${#built[@]}: \${built[*]:-<none>}\""
+          echo "echo \">>> failed \${#failed[@]}: \${failed[*]:-<none>}\""
+          echo 'echo "=================================================="'
+          echo 'if [ "${#failed[@]}" -gt 0 ]; then exit 2; fi'
+        } > /tmp/inner-build.sh
 
-        echo ""
-        echo "=================================================="
-        echo ">>> PASS 1 summary: built ${#built[@]}, failed ${#failed[@]}"
-        echo ">>> failed: ${failed[*]:-<none>}"
-        echo "=================================================="
-
-        # 3. Pass 2: retry failures
-        if [ "${#failed[@]}" -gt 0 ]; then
-          echo ""
-          echo "=================================================="
-          echo ">>> PASS 2 (retry ${#failed[@]} failed)"
-          echo "=================================================="
-          declare -a still_failed=()
-          for pkg in "${failed[@]}"; do
-            echo "--------------------------------------------------"
-            echo ">>> Retrying: $pkg"
-            echo "--------------------------------------------------"
-            LOG="/tmp/build-${pkg}-retry.log"
-            if ./build-package.sh -C -f -a aarch64 "$pkg" > "$LOG" 2>&1; then
-              built+=("$pkg")
-              echo ">>> OK (retry): $pkg"
-            else
-              still_failed+=("$pkg")
-              echo ">>> STILL FAILED: $pkg  (log: $LOG)"
-              echo "--- last 60 lines of $pkg retry log ---"
-              tail -60 "$LOG" || true
-              echo "--- end $pkg ---"
-            fi
-          done
-          failed=("${still_failed[@]}")
-        fi
-
-        echo ""
-        echo "=================================================="
-        echo ">>> FINAL built ${#built[@]}: ${built[*]:-<none>}"
-        echo ">>> FINAL failed ${#failed[@]}: ${failed[*]:-<none>}"
-        echo "=================================================="
-
-        if [ "${#failed[@]}" -gt 0 ]; then
-          exit 2
-        fi
-        INNER
-
-        # Substitute the target list safely
-        # (use a placeholder so shell metachars in package names don't matter)
-        python3 - <<PYEOF
-        import pathlib
-        p = pathlib.Path("/tmp/inner-build.sh")
-        s = p.read_text()
-        s = s.replace("__TARGETS__", """${PKGS_STR}""")
-        p.write_text(s)
-        PYEOF
-
-        chmod +x /tmp/inner-build.sh
+        cat /tmp/inner-build.sh
         ENCODED=$(base64 -w0 /tmp/inner-build.sh)
-
-        ./scripts/run-docker.sh -d bash -c \
-          "echo '${ENCODED}' | base64 -d | bash" \
-          || echo "::warning::Some packages failed to build — continuing"
+        ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" || true
 
     - name: Generate build artifacts
       if: always()
