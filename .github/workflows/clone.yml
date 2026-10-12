@@ -1,0 +1,144 @@
+name: Mirror GitHub Release (Pre-release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_owner:
+        description: 'Upstream owner (e.g. termux)'
+        required: true
+      source_repo:
+        description: 'Upstream repository (e.g. proot-distro)'
+        required: true
+      source_tag:
+        description: 'Upstream release tag (e.g. v4.34.2)'
+        required: true
+      target_tag:
+        description: 'Release tag in this repo (leave empty to use upstream tag)'
+        required: false
+        default: ''
+      target_title:
+        description: 'Release title in this repo (leave empty to use upstream title)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download upstream release assets and metadata
+        env:
+          SOURCE_OWNER: ${{ inputs.source_owner }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import urllib.request
+
+          owner = os.environ["SOURCE_OWNER"]
+          repo = os.environ["SOURCE_REPO"]
+          tag = os.environ["SOURCE_TAG"]
+
+          out = pathlib.Path("release-assets")
+          out.mkdir(parents=True, exist_ok=True)
+
+          api = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
+          req = urllib.request.Request(
+              api,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "github-actions-release-mirror",
+              },
+          )
+
+          with urllib.request.urlopen(req) as r:
+              release = json.load(r)
+
+          # Save upstream release title (name) and tag for later use
+          release_title = release.get("name") or release.get("tag_name") or tag
+          with open("upstream_title.txt", "w") as f:
+              f.write(release_title)
+
+          assets = release.get("assets", [])
+          if not assets:
+              raise SystemExit("No assets found in the upstream release")
+
+          print(f"Found {len(assets)} assets")
+          for asset in assets:
+              name = asset["name"]
+              url = asset["browser_download_url"]
+              dest = out / name
+
+              print(f"Downloading {name}")
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "github-actions-release-mirror"},
+              )
+              with urllib.request.urlopen(req) as r, open(dest, "wb") as f:
+                  shutil.copyfileobj(r, f)
+          PY
+
+      - name: Determine target tag and title
+        id: vars
+        env:
+          TARGET_TAG_INPUT: ${{ inputs.target_tag }}
+          TARGET_TITLE_INPUT: ${{ inputs.target_title }}
+        run: |
+          set -euo pipefail
+
+          # Use input tag if provided, otherwise fall back to source tag
+          if [[ -n "$TARGET_TAG_INPUT" ]]; then
+            FINAL_TAG="$TARGET_TAG_INPUT"
+          else
+            FINAL_TAG="${{ inputs.source_tag }}"
+          fi
+
+          # Use input title if provided, otherwise read upstream title from file
+          if [[ -n "$TARGET_TITLE_INPUT" ]]; then
+            FINAL_TITLE="$TARGET_TITLE_INPUT"
+          else
+            FINAL_TITLE="$(cat upstream_title.txt)"
+          fi
+
+          echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "title=${FINAL_TITLE}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish pre-release in this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_OWNER: ${{ inputs.source_owner }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TARGET_TAG: ${{ steps.vars.outputs.tag }}
+          TARGET_TITLE: ${{ steps.vars.outputs.title }}
+        run: |
+          set -euo pipefail
+
+          files=(release-assets/*)
+          notes="Mirrored from ${SOURCE_OWNER}/${SOURCE_REPO} release ${SOURCE_TAG}"
+
+          if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+
+          gh release create "$TARGET_TAG" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TARGET_TITLE" \
+            --notes "$notes" \
+            --prerelease \
+            --latest=false
