@@ -312,9 +312,8 @@ jobs:
       run: ./scripts/free-space.sh
 
     # =================================================================
-    # Two-pass build with topological ordering and per-failure logs.
-    # Pass 1: build in dependency order (buildorder.py).
-    # Pass 2: retry whatever failed in pass 1.
+    # Build step — FIXED: embed the target list into the inner script
+    # via a placeholder substitution instead of positional args.
     # =================================================================
     - name: Build packages
       run: |
@@ -343,33 +342,37 @@ jobs:
         mkdir -p "$PREFIX/var/lib/dpkg/info"
         cd "$BUILD_ROOT"
 
-        # Wipe stale markers so -f really rebuilds
         rm -rf /data/data/.built-packages 2>/dev/null || true
         rm -rf /data/data/app.xodos2/.built-packages 2>/dev/null || true
         rm -rf /data/data/app.xodos2/files/.built-packages 2>/dev/null || true
 
-        TARGETS="$1"
-        echo ">>> Targets requested: $TARGETS"
+        # Targets embedded by sed at workflow run time
+        TARGETS="__TARGETS__"
 
-        # -------------------------------------------------------------
-        # 1. Compute topological build order across ALL targets and
-        #    their transitive deps using termux's own buildorder.py.
-        #    buildorder.py prints "<pkg> <dir>" one per line.
-        # -------------------------------------------------------------
+        echo ">>> Targets requested (${#TARGETS} chars): $TARGETS"
+
+        # 1. Compute topological order using termux's buildorder.py
         echo ""
         echo ">>> Computing dependency order via buildorder.py"
         ORDER_FILE=/tmp/buildorder-resolved.txt
+        : > "$ORDER_FILE"
+
         if [ -f scripts/buildorder.py ]; then
-          python3 scripts/buildorder.py $TARGETS > /tmp/buildorder-full.txt 2>/dev/null || true
-          # Filter: only keep packages that are among the requested set
-          # OR whose name is a dependency (we can't know the requested
-          # set here, so keep everything buildorder.py emits that
-          # matches one of the target names).
+          # Ask buildorder.py for the FULL graph; then keep entries
+          # whose first column is one of our targets.
+          python3 scripts/buildorder.py $TARGETS > /tmp/buildorder-full.txt 2>/tmp/buildorder-err.txt || {
+            echo ">>> WARN: buildorder.py failed, falling back to requested order"
+            cat /tmp/buildorder-err.txt | head -20 || true
+            : > /tmp/buildorder-full.txt
+          }
+
           for t in $TARGETS; do
-            grep -E "^${t}\b" /tmp/buildorder-full.txt >> "$ORDER_FILE" 2>/dev/null || true
+            # buildorder.py prints "<pkg> <dir>"; match pkg at start of line
+            grep -E "^${t}[[:space:]]" /tmp/buildorder-full.txt >> "$ORDER_FILE" 2>/dev/null || true
           done
-          # If buildorder.py couldn't resolve, fall back to requested order
+
           if [ ! -s "$ORDER_FILE" ]; then
+            echo ">>> buildorder.py produced no matches — falling back to requested order"
             for t in $TARGETS; do
               echo "$t" >> "$ORDER_FILE"
             done
@@ -380,22 +383,18 @@ jobs:
           done
         fi
 
-        # dedupe preserving order
         awk '!seen[$1]++' "$ORDER_FILE" > "$ORDER_FILE.dedup" && mv "$ORDER_FILE.dedup" "$ORDER_FILE"
 
         echo ">>> Resolved order ($(wc -l < "$ORDER_FILE") entries):"
         cat "$ORDER_FILE"
 
-        # -------------------------------------------------------------
-        # 2. Pass 1: build in that order
-        # -------------------------------------------------------------
+        # 2. Pass 1: build in resolved order
         echo ""
         echo "=================================================="
         echo ">>> PASS 1"
         echo "=================================================="
         declare -a failed=()
         declare -a built=()
-        declare -A failure_log
 
         while read -r pkg _rest; do
           [ -z "$pkg" ] && continue
@@ -408,7 +407,6 @@ jobs:
             echo ">>> OK: $pkg"
           else
             failed+=("$pkg")
-            failure_log["$pkg"]="$LOG"
             echo ">>> FAILED: $pkg  (log: $LOG)"
             echo "--- last 60 lines of $pkg log ---"
             tail -60 "$LOG" || true
@@ -422,14 +420,11 @@ jobs:
         echo ">>> failed: ${failed[*]:-<none>}"
         echo "=================================================="
 
-        # -------------------------------------------------------------
-        # 3. Pass 2: retry failures now that deps are installed
-        # -------------------------------------------------------------
+        # 3. Pass 2: retry failures
         if [ "${#failed[@]}" -gt 0 ]; then
           echo ""
           echo "=================================================="
-          echo ">>> PASS 2 (retry of ${#failed[@]} failed packages)"
-          echo ">>> now that all deps are installed"
+          echo ">>> PASS 2 (retry ${#failed[@]} failed)"
           echo "=================================================="
           declare -a still_failed=()
           for pkg in "${failed[@]}"; do
@@ -442,7 +437,6 @@ jobs:
               echo ">>> OK (retry): $pkg"
             else
               still_failed+=("$pkg")
-              failure_log["$pkg"]="$LOG"
               echo ">>> STILL FAILED: $pkg  (log: $LOG)"
               echo "--- last 60 lines of $pkg retry log ---"
               tail -60 "$LOG" || true
@@ -458,21 +452,26 @@ jobs:
         echo ">>> FINAL failed ${#failed[@]}: ${failed[*]:-<none>}"
         echo "=================================================="
 
-        # Save failure names for the workflow to surface
-        printf '%s\n' "${failed[@]}" > /tmp/final-failed.txt 2>/dev/null || true
-
         if [ "${#failed[@]}" -gt 0 ]; then
           exit 2
         fi
         INNER
 
+        # Substitute the target list safely
+        # (use a placeholder so shell metachars in package names don't matter)
+        python3 - <<PYEOF
+        import pathlib
+        p = pathlib.Path("/tmp/inner-build.sh")
+        s = p.read_text()
+        s = s.replace("__TARGETS__", """${PKGS_STR}""")
+        p.write_text(s)
+        PYEOF
+
         chmod +x /tmp/inner-build.sh
         ENCODED=$(base64 -w0 /tmp/inner-build.sh)
 
-        # Pass the target list as $1 to the inner script
-        TARGETS_ESCAPED=$(printf '%q ' "${packages[@]}")
         ./scripts/run-docker.sh -d bash -c \
-          "echo '${ENCODED}' | base64 -d | bash -s -- ${TARGETS_ESCAPED}" \
+          "echo '${ENCODED}' | base64 -d | bash" \
           || echo "::warning::Some packages failed to build — continuing"
 
     - name: Generate build artifacts
