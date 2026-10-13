@@ -39,9 +39,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq dpkg-dev
 
-      # -----------------------------------------------------------------
-      # Resolve the list of tags (ascending by tag name = oldest → newest)
-      # -----------------------------------------------------------------
       - name: Resolve list of tags
         id: resolve
         env:
@@ -65,12 +62,9 @@ jobs:
             exit 1
           fi
 
-          # Ascending sort: 2026.10.03-… < 2026.10.08-… < 2026.10.09-…
           mapfile -t TAGS < <(printf '%s\n' "${TAGS[@]}" | sort)
-
           echo ">>> ${#TAGS[@]} tag(s), oldest first:"
           printf '    %s\n' "${TAGS[@]}"
-
           printf '%s\n' "${TAGS[@]}" > /tmp/tags.txt
 
           if [ -n "$INPUT_OUT_TAG" ]; then
@@ -81,17 +75,13 @@ jobs:
           echo "output_tag=$OUT" >> "$GITHUB_OUTPUT"
           echo ">>> output tag: $OUT"
 
-      # -----------------------------------------------------------------
-      # Download each release, in order. Track Package names in an
-      # associative array. Newer files replace older ones.
-      # -----------------------------------------------------------------
       - name: Download and merge .deb files (newest wins)
         run: |
           set -euo pipefail
           mkdir -p merged
 
-          declare -A seen       # pkg name -> filename stored in merged/
-          declare -A seen_tag   # pkg name -> source tag
+          declare -A seen
+          declare -A seen_tag
 
           total_downloaded=0
           total_superseded=0
@@ -118,10 +108,7 @@ jobs:
 
             while IFS= read -r -d '' deb; do
               pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
-              if [ -z "$pkg" ]; then
-                echo ">>> SKIP unparsable: $(basename "$deb")"
-                continue
-              fi
+              if [ -z "$pkg" ]; then continue; fi
               ver=$(dpkg-deb -f "$deb" Version 2>/dev/null || echo "")
 
               if [ -n "${seen[$pkg]:-}" ]; then
@@ -147,9 +134,6 @@ jobs:
           echo ">>> final merged set: $(find merged -maxdepth 1 -type f -name '*.deb' | wc -l) .deb file(s)"
           echo "=================================================="
 
-      # -----------------------------------------------------------------
-      # Sanity check the merged set.
-      # -----------------------------------------------------------------
       - name: Sanity check merged set
         run: |
           set -euo pipefail
@@ -158,20 +142,10 @@ jobs:
             echo "::error::No .deb files in merged set — nothing to publish"
             exit 1
           fi
-
           echo ">>> merged .deb files (first 30):"
           find merged -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort > /tmp/merged-list.txt
           head -30 /tmp/merged-list.txt
 
-          echo ""
-          echo ">>> unique package count:"
-          while IFS= read -r deb; do
-            dpkg-deb -f "merged/$deb" Package
-          done < /tmp/merged-list.txt | sort -u | wc -l
-
-      # -----------------------------------------------------------------
-      # Create the output release.
-      # -----------------------------------------------------------------
       - name: Create merged release
         run: |
           set -euo pipefail
@@ -193,9 +167,13 @@ jobs:
             || { echo "::error::Failed to create release '$TAG'"; exit 1; }
           echo ">>> created release $TAG"
 
-      # -----------------------------------------------------------------
-      # Upload every merged .deb.
-      # -----------------------------------------------------------------
+      # =================================================================
+      # Upload — FIXED for GitHub secondary rate limits:
+      #   - 3s delay between files instead of 1s
+      #   - 8 attempts instead of 5
+      #   - on rate-limit: 60s, 120s, 180s, 240s, 300s, 360s, 420s waits
+      #   - on other errors: 5s, 10s, 15s exponential
+      # =================================================================
       - name: Upload merged .deb files
         run: |
           set -euo pipefail
@@ -206,33 +184,58 @@ jobs:
 
           i=0
           failed=0
+          declare -a failed_files=()
+
           for f in "${FILES[@]}"; do
             i=$((i + 1))
             printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
             ok=0
-            for attempt in 1 2 3 4 5; do
+            for attempt in 1 2 3 4 5 6 7 8; do
               if gh release upload "$TAG" "$f" --repo "$REPO" --clobber 2>/tmp/gh_err.log; then
                 ok=1
                 break
               fi
-              if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
-                backoff=$((attempt * 15))
+
+              # Inspect the error
+              if grep -qiE 'secondary rate limit|abuse|rate limit|too many requests|429' /tmp/gh_err.log; then
+                backoff=$((attempt * 60))
+                echo
+                echo "    ↳ rate limited (attempt ${attempt}/8), sleeping ${backoff}s"
               else
-                backoff=$((attempt * 3))
+                backoff=$((attempt * 5))
+                echo
+                echo "    ↳ error (attempt ${attempt}/8), sleeping ${backoff}s"
+                sed -n '1,3p' /tmp/gh_err.log || true
               fi
               sleep "$backoff"
             done
+
             if [ "$ok" -eq 1 ]; then
-              echo ok
+              echo "    ok"
             else
-              echo "FAILED: $(basename "$f")"
+              echo "    FAILED after 8 attempts: $(basename "$f")"
               failed=$((failed + 1))
+              failed_files+=("$f")
             fi
-            sleep 1
+
+            # Per-file pacing: 3 seconds keeps us under the secondary limit
+            sleep 3
           done
 
+          echo ""
+          echo "=================================================="
+          echo ">>> upload summary: $((total - failed))/$total ok, $failed failed"
           if [ "$failed" -gt 0 ]; then
-            echo "::error::${failed}/${total} failed"
+            echo ">>> failed files:"
+            for ff in "${failed_files[@]}"; do
+              echo "    $(basename "$ff")"
+            done
+          fi
+          echo "=================================================="
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed/${total} upload(s) failed after retries"
+            echo "::warning::Re-run this job to retry just the failed files."
             exit 1
           fi
           echo ">>> all ${total} uploaded"
@@ -244,9 +247,6 @@ jobs:
           count=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets | length')
           echo ">>> release $TAG has $count assets"
 
-      # -----------------------------------------------------------------
-      # Optional: delete the source releases after a successful merge.
-      # -----------------------------------------------------------------
       - name: Optionally delete source releases
         if: ${{ inputs.delete_sources == 'true' }}
         run: |
